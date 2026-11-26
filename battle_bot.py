@@ -1,19 +1,20 @@
 # -*- coding: utf-8 -*-
-# Бот для війнушок — оновлення 1.1
-# Змінні Railway: BOT_TOKEN (обов'язково), DB_PATH (необов'язково)
+# Бот для війнушок — оновлення 1.1 (база PostgreSQL, дані не стираються)
+# Змінні Railway: BOT_TOKEN і DATABASE_URL
 import html
 import itertools
 import os
 import random
-import sqlite3
 import threading
 import time
 
+import psycopg2
+import psycopg2.extras
 import telebot
 from telebot import types
 
 TOKEN = os.environ["BOT_TOKEN"]
-DB_PATH = os.environ.get("DB_PATH", "bot.db")
+DATABASE_URL = os.environ["DATABASE_URL"]
 ADMINS = {7660211311, 1642108682}
 
 GIFT_COOLDOWN = 2 * 60 * 60   # подарунок раз на 2 години
@@ -47,33 +48,58 @@ PROMOS = {
 bot = telebot.TeleBot(TOKEN, parse_mode="HTML")
 BOT_USERNAME = bot.get_me().username
 
-db = sqlite3.connect(DB_PATH, check_same_thread=False)
-db.row_factory = sqlite3.Row
-lock = threading.Lock()
 
-with lock:
-    db.execute("""CREATE TABLE IF NOT EXISTS users(
-        id INTEGER PRIMARY KEY,
-        username TEXT,
-        name TEXT,
-        power INTEGER DEFAULT 0,
-        last_gift REAL DEFAULT 0,
-        last_battle REAL DEFAULT 0,
-        battles INTEGER DEFAULT 0,
-        coins INTEGER DEFAULT 0,
-        referred_by INTEGER DEFAULT 0)""")
-    # якщо база вже була зі старої версії — додаємо нові колонки
-    for col in ("battles INTEGER DEFAULT 0",
-                "coins INTEGER DEFAULT 0",
-                "referred_by INTEGER DEFAULT 0"):
-        try:
-            db.execute("ALTER TABLE users ADD COLUMN " + col)
-        except sqlite3.OperationalError:
-            pass
-    db.execute("CREATE TABLE IF NOT EXISTS chats(id INTEGER PRIMARY KEY)")
-    db.execute("""CREATE TABLE IF NOT EXISTS promo_uses(
-        user_id INTEGER, code TEXT, PRIMARY KEY(user_id, code))""")
-    db.commit()
+# ---------- база даних (PostgreSQL) ----------
+
+lock = threading.Lock()
+_conn = None
+
+
+def _connect():
+    global _conn
+    _conn = psycopg2.connect(DATABASE_URL)
+    _conn.autocommit = True
+
+
+def query(sql, params=(), one=False, many=False):
+    """Виконує запит. one=True -> один рядок, many=True -> список рядків."""
+    global _conn
+    with lock:
+        for attempt in (1, 2):
+            try:
+                if _conn is None or _conn.closed:
+                    _connect()
+                with _conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                    cur.execute(sql, params)
+                    if one:
+                        return cur.fetchone()
+                    if many:
+                        return cur.fetchall()
+                    return None
+            except (psycopg2.OperationalError, psycopg2.InterfaceError):
+                # зв'язок розірвався — пробуємо підключитись ще раз
+                if attempt == 2:
+                    raise
+                try:
+                    _conn.close()
+                except Exception:
+                    pass
+                _conn = None
+
+
+query("""CREATE TABLE IF NOT EXISTS users(
+    id BIGINT PRIMARY KEY,
+    username TEXT DEFAULT '',
+    name TEXT DEFAULT '',
+    power INTEGER DEFAULT 0,
+    last_gift DOUBLE PRECISION DEFAULT 0,
+    last_battle DOUBLE PRECISION DEFAULT 0,
+    battles INTEGER DEFAULT 0,
+    coins INTEGER DEFAULT 0,
+    referred_by BIGINT DEFAULT 0)""")
+query("CREATE TABLE IF NOT EXISTS chats(id BIGINT PRIMARY KEY)")
+query("""CREATE TABLE IF NOT EXISTS promo_uses(
+    user_id BIGINT, code TEXT, PRIMARY KEY(user_id, code))""")
 
 awaiting_promo = set()   # хто зараз вводить промокод
 challenges = {}          # активні виклики на битву
@@ -98,30 +124,19 @@ def next_level_info(power):
 
 
 def save_user(u):
-    uname = (u.username or "").lower()
-    with lock:
-        db.execute("INSERT OR IGNORE INTO users(id, username, name) VALUES(?,?,?)",
-                   (u.id, uname, u.first_name or ""))
-        db.execute("UPDATE users SET username=?, name=? WHERE id=?",
-                   (uname, u.first_name or "", u.id))
-        db.commit()
+    query("""INSERT INTO users(id, username, name) VALUES(%s, %s, %s)
+             ON CONFLICT (id) DO UPDATE
+             SET username = EXCLUDED.username, name = EXCLUDED.name""",
+          (u.id, (u.username or "").lower(), u.first_name or ""))
 
 
 def get_user(uid):
-    with lock:
-        return db.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+    return query("SELECT * FROM users WHERE id=%s", (uid,), one=True)
 
 
 def find_by_username(username):
-    with lock:
-        return db.execute("SELECT * FROM users WHERE username=?",
-                          (username.lower().lstrip("@"),)).fetchone()
-
-
-def set_power(uid, power):
-    with lock:
-        db.execute("UPDATE users SET power=? WHERE id=?", (max(0, power), uid))
-        db.commit()
+    return query("SELECT * FROM users WHERE username=%s",
+                 (username.lower().lstrip("@"),), one=True)
 
 
 def fmt_time(sec):
@@ -177,9 +192,8 @@ def on_text(message):
     save_user(u)
 
     if message.chat.type in ("group", "supergroup"):
-        with lock:
-            db.execute("INSERT OR IGNORE INTO chats(id) VALUES(?)", (message.chat.id,))
-            db.commit()
+        query("INSERT INTO chats(id) VALUES(%s) ON CONFLICT DO NOTHING",
+              (message.chat.id,))
 
     text = (message.text or "").strip()
     low = text.lower()
@@ -226,10 +240,8 @@ def cmd_start(message, is_new):
         if ref_id and ref_id != u.id and get_user(ref_id):
             premium = bool(getattr(u, "is_premium", False))
             bonus = REF_POWER_PREMIUM if premium else REF_POWER
-            with lock:
-                db.execute("UPDATE users SET power=power+? WHERE id=?", (bonus, ref_id))
-                db.execute("UPDATE users SET referred_by=? WHERE id=?", (ref_id, u.id))
-                db.commit()
+            query("UPDATE users SET power=power+%s WHERE id=%s", (bonus, ref_id))
+            query("UPDATE users SET referred_by=%s WHERE id=%s", (ref_id, u.id))
             try:
                 extra = " (з Telegram Premium 🌟)" if premium else ""
                 bot.send_message(
@@ -270,10 +282,8 @@ def cmd_gift(message):
     new_power = old_power + gift
     new_lvl = get_level(new_power)
 
-    with lock:
-        db.execute("UPDATE users SET power=?, last_gift=? WHERE id=?",
-                   (new_power, now, u.id))
-        db.commit()
+    query("UPDATE users SET power=%s, last_gift=%s WHERE id=%s",
+          (new_power, now, u.id))
 
     msg = f"🎁 Ти отримав <b>+{gift}</b> сили!\n💪 Всього сили: <b>{new_power}</b>"
     if new_lvl > old_lvl:
@@ -331,17 +341,17 @@ def activate_promo(message, raw):
         say(message, "❌ Такого промокоду не існує.")
         return
 
-    with lock:
-        used = db.execute("SELECT 1 FROM promo_uses WHERE user_id=? AND code=?",
-                          (uid, code)).fetchone()
-        if not used:
-            db.execute("INSERT INTO promo_uses(user_id, code) VALUES(?,?)", (uid, code))
-            db.execute("UPDATE users SET coins=coins+?, power=power+? WHERE id=?",
-                       (promo["coins"], promo["power"], uid))
-            db.commit()
-    if used:
+    # якщо цей код людина вже активувала — запис не вставиться
+    inserted = query(
+        "INSERT INTO promo_uses(user_id, code) VALUES(%s, %s) "
+        "ON CONFLICT DO NOTHING RETURNING user_id",
+        (uid, code), one=True)
+    if not inserted:
         say(message, "⚠️ Ти вже активував цей промокод.")
         return
+
+    query("UPDATE users SET coins=coins+%s, power=power+%s WHERE id=%s",
+          (promo["coins"], promo["power"], uid))
 
     rewards = []
     if promo["coins"]:
@@ -403,9 +413,7 @@ def cmd_battle(message):
 
     challenges[cid] = {"a": me["id"], "b": enemy["id"],
                        "chat": message.chat.id, "msg": sent.message_id, "t": now}
-    with lock:
-        db.execute("UPDATE users SET last_battle=? WHERE id=?", (now, me["id"]))
-        db.commit()
+    query("UPDATE users SET last_battle=%s WHERE id=%s", (now, me["id"]))
 
 
 def resolve_battle(a_id, b_id):
@@ -416,11 +424,9 @@ def resolve_battle(a_id, b_id):
 
     winner, loser = (a, b) if win else (b, a)
     steal = min(random.randint(STEAL_MIN, STEAL_MAX), loser["power"])
-    with lock:
-        db.execute("UPDATE users SET power=power+? WHERE id=?", (steal, winner["id"]))
-        db.execute("UPDATE users SET power=power-? WHERE id=?", (steal, loser["id"]))
-        db.execute("UPDATE users SET battles=battles+1 WHERE id IN (?, ?)", (a_id, b_id))
-        db.commit()
+    query("UPDATE users SET power=power+%s WHERE id=%s", (steal, winner["id"]))
+    query("UPDATE users SET power=power-%s WHERE id=%s", (steal, loser["id"]))
+    query("UPDATE users SET battles=battles+1 WHERE id IN (%s, %s)", (a_id, b_id))
 
     return (f"⚔️ <b>БИТВА!</b>\n"
             f"{mention(a)} (💪{p1}, шанс {chance * 100:.0f}%) VS "
@@ -502,9 +508,8 @@ def cmd_news(message):
 
     news = "📰 <b>Новини бота</b>\n\n" + parts[1].strip()
 
-    with lock:
-        user_ids = [r["id"] for r in db.execute("SELECT id FROM users").fetchall()]
-        chat_ids = [r["id"] for r in db.execute("SELECT id FROM chats").fetchall()]
+    user_ids = [r["id"] for r in query("SELECT id FROM users", many=True)]
+    chat_ids = [r["id"] for r in query("SELECT id FROM chats", many=True)]
 
     ok, fail = 0, 0
     for target in set(user_ids + chat_ids):
